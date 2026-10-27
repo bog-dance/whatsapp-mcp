@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,7 +24,9 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -279,7 +282,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			mimeType = mime.TypeByExtension("." + fileExt)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Upload media to WhatsApp servers
@@ -346,7 +352,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(filepath.Base(mediaPath)),
+				FileName:      proto.String(filepath.Base(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -641,7 +648,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -673,6 +680,62 @@ func extractDirectPathFromURL(url string) string {
 
 	// Create proper direct path format
 	return "/" + pathPart
+}
+
+// MuteChatRequest represents the request body for the mute API
+type MuteChatRequest struct {
+	Recipient     string `json:"recipient"`
+	Mute          *bool  `json:"mute"`
+	DurationHours int    `json:"duration_hours"`
+}
+
+// ArchiveChatRequest represents the request body for the archive API
+type ArchiveChatRequest struct {
+	Recipient string `json:"recipient"`
+	Archive   *bool  `json:"archive"`
+}
+
+// resolveRecipientJID mirrors the recipient resolution used by /api/send
+func resolveRecipientJID(recipient string) (types.JID, error) {
+	if strings.Contains(recipient, "@") {
+		return types.ParseJID(recipient)
+	}
+	return types.JID{User: recipient, Server: types.DefaultUserServer}, nil
+}
+
+// GetLastMessageKey returns the timestamp and key of the newest stored message in a chat
+func (store *MessageStore) GetLastMessageKey(chatJID types.JID) (time.Time, *waCommon.MessageKey, error) {
+	var id, sender string
+	var ts time.Time
+	var isFromMe bool
+	err := store.db.QueryRow(
+		"SELECT id, sender, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
+		chatJID.String(),
+	).Scan(&id, &sender, &ts, &isFromMe)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	key := &waCommon.MessageKey{
+		RemoteJID: proto.String(chatJID.String()),
+		FromMe:    proto.Bool(isFromMe),
+		ID:        proto.String(id),
+	}
+	if chatJID.Server == types.GroupServer && !isFromMe {
+		// Stored sender is sometimes only the user part, which can't be turned into a reliable participant JID
+		if !strings.Contains(sender, "@") {
+			return ts, nil, nil
+		}
+		key.Participant = proto.String(sender)
+	}
+	return ts, key, nil
+}
+
+func writeJSONResult(w http.ResponseWriter, success bool, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	if !success {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -774,6 +837,156 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for muting/unmuting chats
+	http.HandleFunc("/api/mute", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MuteChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+		if req.DurationHours < 0 {
+			http.Error(w, "duration_hours must be >= 0", http.StatusBadRequest)
+			return
+		}
+		mute := true
+		if req.Mute != nil {
+			mute = *req.Mute
+		}
+
+		if !client.IsConnected() {
+			writeJSONResult(w, false, "Not connected to WhatsApp")
+			return
+		}
+		jid, err := resolveRecipientJID(req.Recipient)
+		if err != nil {
+			writeJSONResult(w, false, fmt.Sprintf("Error parsing JID: %v", err))
+			return
+		}
+
+		duration := time.Duration(req.DurationHours) * time.Hour
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		if err := client.SendAppState(ctx, appstate.BuildMute(jid, mute, duration)); err != nil {
+			fmt.Println("Mute failed", jid, err)
+			writeJSONResult(w, false, fmt.Sprintf("Failed to update mute state: %v", err))
+			return
+		}
+
+		var msg string
+		switch {
+		case !mute:
+			msg = fmt.Sprintf("Unmuted %s", jid)
+		case duration > 0:
+			msg = fmt.Sprintf("Muted %s for %d hours", jid, req.DurationHours)
+		default:
+			msg = fmt.Sprintf("Muted %s forever", jid)
+		}
+		fmt.Println(msg)
+		writeJSONResult(w, true, msg)
+	})
+
+	// Handler for archiving/unarchiving chats
+	http.HandleFunc("/api/archive", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ArchiveChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+		archive := true
+		if req.Archive != nil {
+			archive = *req.Archive
+		}
+
+		if !client.IsConnected() {
+			writeJSONResult(w, false, "Not connected to WhatsApp")
+			return
+		}
+		jid, err := resolveRecipientJID(req.Recipient)
+		if err != nil {
+			writeJSONResult(w, false, fmt.Sprintf("Error parsing JID: %v", err))
+			return
+		}
+
+		// Falls back to time.Now() and no key inside appstate when nothing is stored locally
+		lastTS, lastKey, err := messageStore.GetLastMessageKey(jid)
+		if err != nil && err != sql.ErrNoRows {
+			fmt.Println("Failed to look up last message for archive", jid, err)
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		if err := client.SendAppState(ctx, appstate.BuildArchive(jid, archive, lastTS, lastKey)); err != nil {
+			fmt.Println("Archive failed", jid, err)
+			writeJSONResult(w, false, fmt.Sprintf("Failed to update archive state: %v", err))
+			return
+		}
+
+		action := "Archived"
+		if !archive {
+			action = "Unarchived"
+		}
+		msg := fmt.Sprintf("%s %s (last message key: %t)", action, jid, lastKey != nil)
+		fmt.Println(msg)
+		writeJSONResult(w, true, msg)
+	})
+
+	// Handler for a full app state resync, used to recover from "mismatching LTHash" errors
+	http.HandleFunc("/api/appstate/resync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Names []string `json:"names"`
+		}
+		if r.ContentLength != 0 {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "Invalid request format", http.StatusBadRequest)
+				return
+			}
+		}
+		if len(req.Names) == 0 {
+			req.Names = []string{string(appstate.WAPatchRegularHigh), string(appstate.WAPatchRegularLow)}
+		}
+		if !client.IsConnected() {
+			writeJSONResult(w, false, "Not connected to WhatsApp")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		defer cancel()
+		var results []string
+		success := true
+		for _, name := range req.Names {
+			if err := client.FetchAppState(ctx, appstate.WAPatchName(name), true, false); err != nil {
+				success = false
+				results = append(results, fmt.Sprintf("%s: %v", name, err))
+			} else {
+				results = append(results, fmt.Sprintf("%s: ok", name))
+			}
+		}
+		msg := strings.Join(results, "; ")
+		fmt.Println("App state resync:", msg)
+		writeJSONResult(w, success, msg)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1013,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -866,10 +1079,21 @@ func main() {
 			return
 		}
 
+		// Pairing by phone number code, if WA_PAIR_PHONE is set
+		if pairPhone := os.Getenv("WA_PAIR_PHONE"); pairPhone != "" {
+			code, err := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+			if err != nil {
+				logger.Errorf("Failed to request pairing code: %v", err)
+			} else {
+				fmt.Printf("\n\n    PAIRING CODE: %s\n\n", code)
+			}
+		}
+
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				fmt.Printf("RAWQR:%s\n", evt.Code)
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				connected <- true
@@ -973,7 +1197,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1212,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

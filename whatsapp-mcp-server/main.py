@@ -12,7 +12,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    mute_chat as whatsapp_mute_chat,
+    archive_chat as whatsapp_archive_chat
 )
 
 # Initialize FastMCP server
@@ -245,6 +247,37 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def mute_chat(recipient: str, mute: bool = True, duration_hours: int = 0) -> Dict[str, Any]:
+    """Mute or unmute a WhatsApp chat. Syncs to all linked devices.
+
+    Args:
+        recipient: Phone number with country code but no + or other symbols, or a JID
+                 (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        mute: True to mute, False to unmute
+        duration_hours: How long to mute for; 0 means forever. Ignored when unmuting.
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_mute_chat(recipient, mute, duration_hours)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def archive_chat(recipient: str, archive: bool = True) -> Dict[str, Any]:
+    """Archive or unarchive a WhatsApp chat. Archiving also unpins the chat. Syncs to all linked devices.
+
+    Args:
+        recipient: Phone number with country code but no + or other symbols, or a JID
+                 (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        archive: True to archive, False to unarchive
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_archive_chat(recipient, archive)
+    return {"success": success, "message": status_message}
 
 if __name__ == "__main__":
     # Initialize and run the server

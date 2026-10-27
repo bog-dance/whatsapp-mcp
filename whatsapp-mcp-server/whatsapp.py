@@ -765,3 +765,25 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def _post_chat_action(endpoint: str, payload: dict) -> Tuple[bool, str]:
+    try:
+        if not payload.get("recipient"):
+            return False, "Recipient must be provided"
+
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/{endpoint}", json=payload, timeout=60)
+        try:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        except ValueError:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def mute_chat(recipient: str, mute: bool = True, duration_hours: int = 0) -> Tuple[bool, str]:
+    return _post_chat_action("mute", {"recipient": recipient, "mute": mute, "duration_hours": duration_hours})
+
+def archive_chat(recipient: str, archive: bool = True) -> Tuple[bool, str]:
+    return _post_chat_action("archive", {"recipient": recipient, "archive": archive})
