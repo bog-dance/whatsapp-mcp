@@ -234,19 +234,18 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-    
+    file_path, message = whatsapp_download_media(message_id, chat_jid)
+
     if file_path:
         return {
             "success": True,
-            "message": "Media downloaded successfully",
+            "message": message,
             "file_path": file_path
         }
-    else:
-        return {
-            "success": False,
-            "message": "Failed to download media"
-        }
+    return {
+        "success": False,
+        "message": f"Failed to download media: {message}"
+    }
 
 @mcp.tool()
 def mute_chat(recipient: str, mute: bool = True, duration_hours: int = 0) -> Dict[str, Any]:
